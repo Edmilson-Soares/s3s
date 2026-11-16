@@ -13,7 +13,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# fogus3s (lib Rust), biblioteca gerada e dados do servidor
+# fogus3s (lib Rust), dados do servidor
 fogus3s/target/
-native/
 data/

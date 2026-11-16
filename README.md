@@ -25,10 +25,13 @@ o erro (com a lista de caminhos tentados) volta na primeira chamada que precisar
 |---|---|---|
 | `windows-x64` | `native/windows-x64/fogus3s.dll` | incluído |
 | `windows-arm64` | `native/windows-arm64/fogus3s.dll` | — |
-| `linux-x64` | `native/linux-x64/libfogus3s.so` | — |
-| `linux-arm64` | `native/linux-arm64/libfogus3s.so` | — |
-| `macos-x64` | `native/macos-x64/libfogus3s.dylib` | — |
-| `macos-arm64` | `native/macos-arm64/libfogus3s.dylib` | — |
+| `linux-x64` | `native/linux-x64/libfogus3s.so` | incluído |
+| `linux-arm64` | `native/linux-arm64/libfogus3s.so` | incluído |
+| `macos-x64` | `native/macos-x64/libfogus3s.dylib` | incluído |
+| `macos-arm64` | `native/macos-arm64/libfogus3s.dylib` | incluído |
+
+**Instalação** (Fogu 0.8.0+): `fogu add Edmilson-Soares/s3s@^0.2.0`. Os binários de `native/` vão
+no repositório git, então a lib já funciona depois de instalada — sem Rust/cargo na máquina.
 
 Ordem de busca: o caminho passado a `load(path)`, a variável `FOGU_S3S_LIB`,
 `native/<plataforma>/`, `native/` e o build do cargo no projeto em execução, uma
@@ -47,7 +50,7 @@ sh build.sh                  # Linux/macOS/WSL: o sistema atual
 sh build.sh all              # Linux x64/arm64 e macOS x64/arm64 (cargo-zigbuild + zig)
 ```
 
-## Callbacks do fogu:ffi (Fogu 0.7+, testado com o 0.7.4)
+## Callbacks do fogu:ffi (requer Fogu 0.8.0+)
 
 A camada nativa usa `ffi.callback` (veja `_native.fg`, igual em todas as libs deste repositório):
 
@@ -61,7 +64,7 @@ A camada nativa usa `ffi.callback` (veja `_native.fg`, igual em todas as libs de
   fora do frame nativo (com `?`, erros e `sleep` normais).
 - **Esperas cooperativas**: uma chamada FFI bloqueante congela todas as tarefas `fg`, então as
   esperas longas são feitas em fatias de 10 ms com `time.delay(1ms)` entre elas.
-- **Fogu 0.7.4**: o código compilado chama direto as funções FFI de assinatura numérica (sem
+- **Fogu 0.7.4+** (e 0.8.0): o código compilado chama direto as funções FFI de assinatura numérica (sem
   alocação por chamada), então sondar status/eventos num laço é barato; `fogu .` roda o projeto
   (o script `start` do `fogu.json`); os tipos `int32`, `uint8`, `float64`... valem nas assinaturas.
 <!-- /fogu:plataformas -->
