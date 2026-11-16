@@ -1,0 +1,152 @@
+// Testes do s3.fg. Precisam da lib nativa (fogu run build:native).
+// Sobem servidores em portas livres (127.0.0.1:0) com dados numa pasta
+// temporária; o cliente é o fogu:s3 (HTTP + SigV4) e o fogu:http.
+//   fogu test
+import { test, expect } from "fogu:test"
+import s3s from "./s3.fg"
+import fs from "fogu:fs"
+import http from "fogu:http"
+import path from "fogu:path"
+import time from "fogu:time"
+
+fn tempRoot(name) {
+    return path.join(fs.tempDir(), `fogus3s-${name}-${time.now()}`)
+}
+
+test("carrega a lib nativa", (): error => {
+    expect(s3s.version()?).toBe("0.1.0")
+    return nil
+})
+
+test("armazenamento direto: buckets e objetos", (): error => {
+    const root = tempRoot("store")
+    const store = s3s.open(root)?
+    expect(fs.isDir(root)).toBe(true)
+    expect(store.hasBucket("docs")?).toBe(false)
+    store.createBucket("docs")?
+    expect(store.hasBucket("docs")?).toBe(true)
+    const [_dup, dup] = store.createBucket("docs")
+    expect(dup.message).toContain("BucketAlreadyExists")
+    expect((store.buckets()?)[0].name).toBe("docs")
+
+    const docs = store.bucket("docs")?
+    const put = docs.put("a/ola.txt", "olá s3", { contentType: "text/plain", metadata: { autor: "fogu" } })?
+    expect(put.size).toBe(7)
+    expect(len(put.etag) >= 32).toBe(true)
+    expect(docs.has("a/ola.txt")?).toBe(true)
+    expect(docs.getText("a/ola.txt")?).toBe("olá s3")
+    expect((docs.get("a/ola.txt")?).hex()).toBe(bytes("olá s3").hex())
+    expect(docs.getText("a/ola.txt", { range: "bytes=0-1" })?).toBe("ol")
+
+    const h = docs.head("a/ola.txt")?
+    expect(h.size).toBe(7)
+    expect(h.content_type).toBe("text/plain")
+    expect(h.metadata.autor).toBe("fogu")
+
+    docs.copy("a/ola.txt", "b/copia.txt")?
+    const l = docs.list("a/")?
+    expect(len(l.objects)).toBe(1)
+    expect(l.objects[0].key).toBe("a/ola.txt")
+    expect(l.objects[0].size).toBe(7)
+    expect(l.truncated).toBe(false)
+    const d = docs.list("", { delimiter: "/" })?
+    expect(d.prefixes).toEqual(["a/", "b/"])
+    expect(len(d.objects)).toBe(0)
+
+    const file = path.join(root, "saida.txt")
+    expect(docs.getFile("b/copia.txt", file)?).toBe(7)
+    expect(fs.readText(file)?).toBe("olá s3")
+    docs.putFile("c/arquivo.txt", file, { contentType: "text/plain" })?
+    expect(docs.getText("c/arquivo.txt")?).toBe("olá s3")
+
+    const [_g, missing] = docs.get("nao-existe")
+    expect(missing.message).toContain("NoSuchKey")
+    expect(docs.has("nao-existe")?).toBe(false)
+
+    const [_r, notEmpty] = docs.remove()
+    expect(notEmpty.message).toContain("BucketNotEmpty")
+    docs.delete("a/ola.txt")?
+    docs.delete("b/copia.txt")?
+    docs.delete("c/arquivo.txt")?
+    docs.remove()?
+    expect(store.hasBucket("docs")?).toBe(false)
+
+    // force apaga o bucket com objetos dentro.
+    const tmp = store.bucket("tmp", true)?
+    tmp.put("x", "1")?
+    tmp.remove(true)?
+    expect(store.hasBucket("tmp")?).toBe(false)
+
+    store.close()?
+    fs.removeAll(root)
+    return nil
+})
+
+test("servidor + cliente fogu:s3 (SigV4)", (): error => {
+    const root = tempRoot("server")
+    const server = s3s.listen({ bind: "127.0.0.1:0", root: root, accessKey: "ak", secretKey: "sk" })?
+    expect(server.port > 0).toBe(true)
+    expect(server.auth).toBe(true)
+    expect(server.url).toBe(`http://127.0.0.1:${server.port}`)
+    server.createBucket("fotos")?
+
+    const client = server.client({ bucket: "fotos" })?
+    client.put("2024/a.txt", "um", { contentType: "text/plain" })?
+    client.put("2024/b.txt", "dois")?
+    expect(client.get("2024/a.txt")?).toBe("um")
+    expect(client.exists("2024/b.txt")?).toBe(true)
+    const keys = []
+    for o in client.list("2024/")? { keys.push(o.key) }
+    expect(keys).toEqual(["2024/a.txt", "2024/b.txt"])
+    expect((client.listBuckets()?)[0].name).toBe("fotos")
+
+    // O que o cliente gravou por HTTP está no armazenamento direto, e vice-versa.
+    expect(server.store.getText("fotos", "2024/b.txt")?).toBe("dois")
+    server.store.put("fotos", "2024/c.txt", "três")?
+    expect(client.get("2024/c.txt")?).toBe("três")
+    client.delete("2024/a.txt")?
+    expect(server.store.exists("fotos", "2024/a.txt")?).toBe(false)
+
+    // Cada requisição virou um evento request.
+    const reqs = []
+    for ev in server.events(1s)? {
+        if ev["type"] == "request" { reqs.push(ev) }
+    }
+    expect(len(reqs) >= 7).toBe(true)
+    expect(reqs[0].method).toBe("PUT")
+    expect(reqs[0].bucket).toBe("fotos")
+    expect(reqs[0].key).toBe("2024/a.txt")
+    expect(reqs[0].status).toBe(200)
+    expect(reqs[0].remote).toContain("127.0.0.1:")
+    expect(server.requests()? >= 7).toBe(true)
+
+    // Credenciais erradas e requisição sem assinatura são recusadas.
+    const bad = server.client({ bucket: "fotos", secretKey: "errada" })?
+    const [_b, badErr] = bad.get("2024/b.txt")
+    expect(badErr != nil).toBe(true)
+    const r = http.get(`${server.url}/fotos/2024/b.txt`, { timeout: 5s })?
+    expect(r.status).toBe(403)
+
+    server.stop()?
+    expect(server.handle).toBe(0)
+    fs.removeAll(root)
+    return nil
+})
+
+test("servidor anônimo (sem credenciais) aceita HTTP sem assinatura", (): error => {
+    const root = tempRoot("anon")
+    const server = s3s.listen({ bind: "127.0.0.1:0", root: root })?
+    expect(server.auth).toBe(false)
+    server.createBucket("pub")?
+    const put = http.put(`${server.url}/pub/x.txt`, "oi", { headers: { "content-type": "text/plain" }, timeout: 5s })?
+    expect(put.status).toBe(200)
+    const get = http.get(`${server.url}/pub/x.txt`, { timeout: 5s })?
+    expect(get.status).toBe(200)
+    expect(get.body).toBe("oi")
+    expect(server.store.getText("pub", "x.txt")?).toBe("oi")
+    const missing = http.get(`${server.url}/pub/nada`, { timeout: 5s })?
+    expect(missing.status).toBe(404)
+    server.stop()?
+    fs.removeAll(root)
+    return nil
+})

@@ -1,0 +1,378 @@
+// s3.fg — servidor S3 para Fogu, sobre a lib Rust fogus3s (crates s3s +
+// s3s-fs) via fogu:ffi, com acesso direto aos buckets/objetos sem HTTP.
+//
+// A lib roda o servidor (hyper + s3s) em threads próprias, guarda os objetos
+// em disco (s3s-fs: uma pasta por bucket, um arquivo por objeto) e enfileira
+// um evento `request` por requisição atendida. serve()/events()/next() os
+// recebem por callback (ffi.callback, Fogu 0.7+): fs3_dispatch espera na
+// fila e entrega um lote de uma vez. Qualquer cliente S3 (aws cli, MinIO
+// client, SDKs) funciona com assinatura V4; `server.client()` devolve um
+// cliente `fogu:s3` já apontado para o servidor. Veja README.md.
+import { Native, Pump, ms, mem } from "./_native.fg"
+import s3client from "fogu:s3"
+import json from "fogu:json"
+import time from "fogu:time"
+
+const _native = new Native("s3s", "fogus3s", "fs3", {
+    fs3_version: [["buffer", "i64"], "i64"],
+    fs3_last_error: [["buffer", "i64"], "i64"],
+    fs3_set_sink: [["ptr"], "i32"],
+    fs3_open: [["str"], "i64"],
+    fs3_listen: [["str"], "i64"],
+    fs3_info: [["i64", "buffer", "i64"], "i64"],
+    fs3_requests: [["i64"], "i64"],
+    fs3_dispatch: [["i64", "i64", "i64", "ptr"], "i64"],
+    fs3_close: [["i64"], "i32"],
+    fs3_buckets: [["i64", "buffer", "i64"], "i64"],
+    fs3_bucket_create: [["i64", "str"], "i32"],
+    fs3_bucket_delete: [["i64", "str", "i32"], "i32"],
+    fs3_bucket_exists: [["i64", "str"], "i32"],
+    fs3_list: [["i64", "str", "str", "str", "i64", "str", "buffer", "i64"], "i64"],
+    fs3_put: [["i64", "str", "str", "buffer", "i64", "str", "buffer", "i64"], "i64"],
+    fs3_put_file: [["i64", "str", "str", "str", "str", "buffer", "i64"], "i64"],
+    fs3_get: [["i64", "str", "str", "str", "buffer", "i64"], "i64"],
+    fs3_get_file: [["i64", "str", "str", "str", "str"], "i64"],
+    fs3_head: [["i64", "str", "str", "buffer", "i64"], "i64"],
+    fs3_exists: [["i64", "str", "str"], "i32"],
+    fs3_delete: [["i64", "str", "str"], "i32"],
+    fs3_copy: [["i64", "str", "str", "str", "str", "buffer", "i64"], "i64"],
+}, "FOGU_S3S_LIB")
+const _f = _native.api
+
+// No import: reconhece o sistema e a arquitetura e já carrega o binário
+// certo (native/<so>-<arch>/...). Se faltar, o erro volta na primeira chamada.
+_native.autoload()
+
+// O que foi detectado e carregado: { platform, os, file, path, loaded, error }.
+export fn nativeInfo() { return _native.info() }
+
+// Carrega a biblioteca nativa (native/<plataforma>/fogus3s, native/fogus3s,
+// o build do cargo, ou FOGU_S3S_LIB). `path` força um arquivo ou pasta.
+export fn load(path = nil) {
+    return _native.load(path)
+}
+
+// Caminho da lib carregada (nil antes de load()).
+export fn libraryPath() { return _native.path }
+
+export fn version() {
+    load()?
+    return _native.text((b, n) => _f.fs3_version(b, n))
+}
+
+fn _status(rc) { return _native.status(rc) }
+
+// 1/0/-1 da lib -> true/false/erro.
+fn _bool(rc) {
+    if rc < 0 { return nil, _native.lastError() }
+    return rc == 1, nil
+}
+
+fn _flag(v) {
+    if v == true { return 1 }
+    return 0
+}
+
+// Opções de put/putFile em camelCase (como o fogu:s3) ou snake_case -> JSON da lib.
+fn _putOpts(options) {
+    const o = {}
+    const pick = (a, b) => options.get(a) ?? options.get(b)
+    const ct = pick("contentType", "content_type")
+    if ct != nil { o.content_type = ct }
+    const cc = pick("cacheControl", "cache_control")
+    if cc != nil { o.cache_control = cc }
+    const ce = pick("contentEncoding", "content_encoding")
+    if ce != nil { o.content_encoding = ce }
+    const cd = pick("contentDisposition", "content_disposition")
+    if cd != nil { o.content_disposition = cd }
+    const meta = options.get("metadata")
+    if meta != nil { o.metadata = meta }
+    return json.stringify(o)
+}
+
+fn _range(options) { return options.get("range") ?? "" }
+
+// Armazenamento em disco (uma pasta): buckets e objetos, sem passar por HTTP.
+// É o mesmo armazenamento que o servidor usa (server.store), então o que um
+// cliente S3 grava aparece aqui e vice-versa.
+export struct Store {
+    handle = 0
+
+    new(handle) { this.handle = handle }
+
+    // { address, port, url, root, auth, listening, requests }
+    info() { return _native.json((b, n) => _f.fs3_info(this.handle, b, n)) }
+
+    // [{ name, created }]
+    buckets() { return _native.json((b, n) => _f.fs3_buckets(this.handle, b, n)) }
+
+    createBucket(name) { return _status(_f.fs3_bucket_create(this.handle, name)) }
+
+    // Apaga o bucket; precisa estar vazio (BucketNotEmpty), a menos que force = true.
+    deleteBucket(name, force = false) { return _status(_f.fs3_bucket_delete(this.handle, name, _flag(force))) }
+
+    hasBucket(name) { return _bool(_f.fs3_bucket_exists(this.handle, name)) }
+
+    // Um Bucket para encadear operações; create = true cria se não existir.
+    bucket(name, create = false) {
+        if create {
+            const has = this.hasBucket(name)?
+            if !has { this.createBucket(name)? }
+        }
+        return new Bucket(this, name), nil
+    }
+
+    // Lista objetos (ListObjectsV2). options: delimiter ("/" agrupa "pastas"
+    // em prefixes), max (padrão 1000), token (continuação).
+    // { objects: [{ key, size, etag, modified }], prefixes, truncated, next }
+    list(bucket, prefix = "", options = {}) {
+        const delimiter = options.get("delimiter") ?? ""
+        const max = options.get("max") ?? 0
+        const token = options.get("token") ?? ""
+        return _native.json((b, n) => _f.fs3_list(this.handle, bucket, prefix, delimiter, max, token, b, n))
+    }
+
+    // Grava data (str, buffer ou lista de bytes). options: contentType,
+    // cacheControl, contentEncoding, contentDisposition, metadata { k: v }.
+    // Devolve { etag, size }.
+    put(bucket, key, data, options = {}) {
+        const [m, n] = mem(data)
+        const opts = _putOpts(options)
+        return _native.json((b, c) => _f.fs3_put(this.handle, bucket, key, m, n, opts, b, c))
+    }
+
+    // Envia um arquivo do disco em stream (sem carregar na memória).
+    putFile(bucket, key, path, options = {}) {
+        const opts = _putOpts(options)
+        return _native.json((b, c) => _f.fs3_put_file(this.handle, bucket, key, path, opts, b, c))
+    }
+
+    // Lê o objeto como buffer. options.range ("bytes=0-99") lê só uma faixa.
+    get(bucket, key, options = {}) {
+        const range = _range(options)
+        return _native.bytes((b, n) => _f.fs3_get(this.handle, bucket, key, range, b, n))
+    }
+
+    // Lê o objeto como texto (UTF-8).
+    getText(bucket, key, options = {}) {
+        const range = _range(options)
+        return _native.text((b, n) => _f.fs3_get(this.handle, bucket, key, range, b, n))
+    }
+
+    // Grava o objeto num arquivo do disco (em stream). Devolve os bytes gravados.
+    getFile(bucket, key, path, options = {}) {
+        return _native.num(_f.fs3_get_file(this.handle, bucket, key, path, _range(options)))
+    }
+
+    // { key, size, etag, modified, content_type, metadata }
+    head(bucket, key) { return _native.json((b, n) => _f.fs3_head(this.handle, bucket, key, b, n)) }
+
+    exists(bucket, key) { return _bool(_f.fs3_exists(this.handle, bucket, key)) }
+
+    delete(bucket, key) { return _status(_f.fs3_delete(this.handle, bucket, key)) }
+
+    // Copia dentro do armazenamento (dstBucket vazio = o mesmo bucket). { etag }
+    copy(bucket, key, dstKey, dstBucket = "") {
+        let dst = dstBucket
+        if dst == "" { dst = bucket }
+        return _native.json((b, n) => _f.fs3_copy(this.handle, bucket, key, dst, dstKey, b, n))
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _f.fs3_close(this.handle)
+        this.handle = 0
+        return _status(rc)
+    }
+}
+
+// Um bucket de um Store: as mesmas operações, sem repetir o nome.
+export struct Bucket {
+    store = nil
+    name = ""
+
+    new(store, name) {
+        this.store = store
+        this.name = name
+    }
+
+    exists() { return this.store.hasBucket(this.name) }
+    list(prefix = "", options = {}) { return this.store.list(this.name, prefix, options) }
+    put(key, data, options = {}) { return this.store.put(this.name, key, data, options) }
+    putFile(key, path, options = {}) { return this.store.putFile(this.name, key, path, options) }
+    get(key, options = {}) { return this.store.get(this.name, key, options) }
+    getText(key, options = {}) { return this.store.getText(this.name, key, options) }
+    getFile(key, path, options = {}) { return this.store.getFile(this.name, key, path, options) }
+    head(key) { return this.store.head(this.name, key) }
+    has(key) { return this.store.exists(this.name, key) }
+    delete(key) { return this.store.delete(this.name, key) }
+    copy(key, dstKey, dstBucket = "") { return this.store.copy(this.name, key, dstKey, dstBucket) }
+    // Apaga o bucket (force = true apaga também os objetos).
+    remove(force = false) { return this.store.deleteBucket(this.name, force) }
+}
+
+// Abre (criando se preciso) a pasta `root` como armazenamento, sem servidor.
+export fn open(root = "data") {
+    load()?
+    const handle = _f.fs3_open(root)
+    if handle < 0 { return nil, _native.lastError() }
+    return new Store(handle), nil
+}
+
+export struct S3Server {
+    handle = 0
+    store = nil
+    address = ""
+    port = 0
+    url = ""
+    root = ""
+    auth = false
+    accessKey = nil
+    secretKey = nil
+    _pump = nil
+    _queue = nil
+
+    new(handle, accessKey, secretKey) {
+        this.handle = handle
+        this.store = new Store(handle)
+        this.accessKey = accessKey
+        this.secretKey = secretKey
+        this._pump = new Pump()
+        this._queue = []
+    }
+
+    // { address, port, url, root, auth, listening, requests }
+    info() { return this.store.info() }
+
+    // Requisições HTTP atendidas até agora.
+    requests() { return _native.num(_f.fs3_requests(this.handle)) }
+
+    // Até `max` eventos que chegarem em timeoutMs (duração ou ms; -1 = sem
+    // limite). Espera em fatias, sem travar as outras tarefas fg.
+    events(timeoutMs = 0, max = 64) {
+        if this.handle == 0 { return [], nil }
+        const h = this.handle
+        return this._pump.wait(ms(timeoutMs),
+            (slice, cb) => _f.fs3_dispatch(h, slice, max, cb),
+            () => _native.lastError(),
+            () => this.handle != 0)
+    }
+
+    // Próximo evento (map) ou nil se nada chegou em timeoutMs.
+    next(timeoutMs = 0) {
+        if len(this._queue) == 0 {
+            this._queue = this.events(timeoutMs)?
+        }
+        if len(this._queue) == 0 { return nil, nil }
+        const ev = this._queue[0]
+        this._queue = this._queue.slice(1)
+        return ev, nil
+    }
+
+    // Um cliente fogu:s3 (HTTP + assinatura V4) apontado para este servidor,
+    // com as credenciais do servidor. options: bucket, timeout, accessKey,
+    // secretKey (para testar outras credenciais), region...
+    // O fogu:s3 sempre assina, e um servidor sem credenciais recusa requisições
+    // assinadas: para usá-lo, suba o servidor com accessKey/secretKey (um
+    // servidor anônimo serve clientes sem assinatura, como fogu:http ou curl).
+    client(options = {}) {
+        const ak = options.get("accessKey") ?? this.accessKey
+        const sk = options.get("secretKey") ?? this.secretKey
+        if ak == nil || sk == nil {
+            return nil, error("s3s: o servidor foi iniciado sem credenciais; o cliente fogu:s3 precisa de accessKey/secretKey (passe em listen() ou em client())")
+        }
+        const cfg = { endpoint: this.url, region: "us-east-1", pathStyle: true, accessKey: ak, secretKey: sk }
+        for k, v in options { cfg[k] = v }
+        return s3client.connect(cfg)
+    }
+
+    // Atalhos para o armazenamento (server.store tem o resto).
+    buckets() { return this.store.buckets() }
+    createBucket(name) { return this.store.createBucket(name) }
+    deleteBucket(name, force = false) { return this.store.deleteBucket(name, force) }
+    hasBucket(name) { return this.store.hasBucket(name) }
+    bucket(name, create = false) { return this.store.bucket(name, create) }
+
+    // Para o servidor, fecha o armazenamento e libera o handle.
+    stop() {
+        if this.handle == 0 { return true, nil }
+        const rc = _f.fs3_close(this.handle)
+        this.handle = 0
+        this.store.handle = 0
+        this._pump.close()
+        return _status(rc)
+    }
+
+    // Laço de eventos: chama handlers[ev.type](ev, this) e, se existir,
+    // handlers.event(ev, this) para todo evento. Termina quando stop() é
+    // chamado ou um handler retorna "stop". Entre as esperas (de até `slice`)
+    // as outras tarefas fg rodam.
+    serve(handlers, slice = 20ms) {
+        const h = this.handle
+        const wait = ms(slice)
+        while this.handle != 0 {
+            const evs = this._pump.take((cb) => _f.fs3_dispatch(h, wait, 64, cb), () => _native.lastError())?
+            if len(evs) == 0 {
+                time.delay(0ms)
+                continue
+            }
+            for ev in evs {
+                if handlers.has("event") && handlers.event(ev, this) == "stop" { return true, nil }
+                const fn_ = handlers.get(ev["type"])
+                if fn_ != nil && fn_(ev, this) == "stop" { return true, nil }
+                if this.handle == 0 { return true, nil }
+            }
+        }
+        return true, nil
+    }
+}
+
+// Sobe um servidor S3. config (todas opcionais):
+//   bind         "127.0.0.1:9000" (porta 0 escolhe uma livre; veja server.port)
+//   root         "data" — pasta dos dados (criada se não existir)
+//   accessKey / secretKey   credenciais (SigV4) aceitas; sem elas o servidor
+//                           aceita requisições anônimas (sem assinatura)
+//   credentials  { accessKey: secretKey, ... } para várias credenciais
+//   domain       domínio base para buckets por host (bucket.dominio); sem ele,
+//                só path-style (http://host:porta/bucket/chave)
+//   events       true: cada requisição vira um evento `request`
+export fn listen(config = {}) {
+    load()?
+    const cfg = {
+        bind: config.get("bind") ?? "127.0.0.1:9000",
+        root: config.get("root") ?? "data",
+        events: config.get("events") ?? true,
+    }
+    const ak = config.get("accessKey") ?? config.get("access_key")
+    const sk = config.get("secretKey") ?? config.get("secret_key")
+    if ak != nil {
+        cfg.access_key = ak
+        cfg.secret_key = sk ?? ""
+    }
+    const creds = config.get("credentials")
+    if creds != nil { cfg.credentials = creds }
+    const domain = config.get("domain")
+    if domain != nil { cfg.domain = domain }
+
+    const handle = _f.fs3_listen(json.stringify(cfg))
+    if handle < 0 { return nil, _native.lastError() }
+    let firstKey = ak
+    let firstSecret = sk
+    if firstKey == nil && creds != nil {
+        for k, v in creds {
+            firstKey = k
+            firstSecret = v
+            break
+        }
+    }
+    const server = new S3Server(handle, firstKey, firstSecret)
+    const ev = server.next(1000)?
+    if ev != nil && ev["type"] == "listening" {
+        server.address = ev.address
+        server.port = ev.port
+        server.root = ev.root
+        server.auth = ev.auth
+        server.url = `http://${ev.address}:${ev.port}`
+    }
+    return server, nil
+}

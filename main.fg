@@ -1,0 +1,44 @@
+// Exemplo: sobe um servidor S3 local (pasta data/), usa o cliente fogu:s3
+// contra ele, lê o mesmo objeto direto do armazenamento e fica mostrando o
+// log de acessos. Qualquer cliente S3 funciona:
+//   AWS_ACCESS_KEY_ID=fogu AWS_SECRET_ACCESS_KEY=fogusecret \
+//   aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://demo/
+//   fogu run build:native && fogu run main.fg      (S3_BIND muda o endereço)
+import s3s from "./s3.fg"
+
+fn main() {
+    print(`fogus3s ${s3s.version()?}`)
+    const server = s3s.listen({
+        bind: Fogu.env["S3_BIND"] ?? "127.0.0.1:9000",
+        root: "data",
+        accessKey: "fogu",
+        secretKey: "fogusecret",
+    })?
+    print(`servidor S3 em ${server.url} (dados em ${server.root})`)
+
+    // Operações diretas (sem HTTP): garante o bucket.
+    const demo = server.bucket("demo", true)?
+
+    // Cliente fogu:s3 (HTTP + assinatura V4) apontado para este servidor.
+    const client = server.client({ bucket: "demo" })?
+    client.put("notas/ola.txt", "Olá do Fogu!", { contentType: "text/plain" })?
+    print(`cliente leu: ${client.get("notas/ola.txt")?}`)
+    for obj in client.list("notas/")? { print(`  ${obj.key} (${obj.size} bytes)`) }
+    print(`direto do disco: ${demo.getText("notas/ola.txt")?}`)
+
+    // O log de acessos das chamadas acima.
+    for ev in server.events(500ms)? {
+        if ev["type"] == "request" { print(`  ${ev.method} ${ev.path} -> ${ev.status} em ${int(ev.ms)}ms`) }
+    }
+
+    print("servindo... (Ctrl+C para parar)")
+    server.serve({
+        request: (ev, _srv) => { print(`${ev.remote} ${ev.method} ${ev.path} -> ${ev.status}`) },
+        error: (ev, _srv) => { print(`erro: ${ev.message}`) },
+    })?
+    server.stop()?
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil { print(`erro: ${err.message}`) }
